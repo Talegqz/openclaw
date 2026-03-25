@@ -4,6 +4,7 @@ import path from "node:path";
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig, ConfigFileSnapshot } from "../config/types.openclaw.js";
+import { BUNDLED_RUNTIME_SIDECAR_PATHS } from "../extensions/public-artifacts.js";
 import type { UpdateRunResult } from "../infra/update-runner.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { createCliRuntimeCapture } from "./test-runtime-capture.js";
@@ -27,15 +28,8 @@ const formatPortDiagnostics = vi.fn();
 const pathExists = vi.fn();
 const syncPluginsForUpdateChannel = vi.fn();
 const updateNpmInstalledPlugins = vi.fn();
+const nodeVersionSatisfiesEngine = vi.fn();
 const { defaultRuntime: runtimeCapture, resetRuntimeCapture } = createCliRuntimeCapture();
-const REQUIRED_BUNDLED_RUNTIME_SIDECARS = [
-  "dist/extensions/whatsapp/light-runtime-api.js",
-  "dist/extensions/whatsapp/runtime-api.js",
-  "dist/extensions/matrix/helper-api.js",
-  "dist/extensions/matrix/runtime-api.js",
-  "dist/extensions/matrix/thread-bindings-runtime.js",
-  "dist/extensions/msteams/runtime-api.js",
-] as const;
 
 vi.mock("@clack/prompts", () => ({
   confirm,
@@ -64,8 +58,17 @@ vi.mock("../infra/update-check.js", async (importOriginal) => {
   return {
     ...actual,
     checkUpdateStatus: vi.fn(),
+    fetchNpmPackageTargetStatus: vi.fn(),
     fetchNpmTagVersion: vi.fn(),
     resolveNpmChannelTag: vi.fn(),
+  };
+});
+
+vi.mock("../infra/runtime-guard.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../infra/runtime-guard.js")>();
+  return {
+    ...actual,
+    nodeVersionSatisfiesEngine,
   };
 });
 
@@ -147,7 +150,7 @@ vi.mock("../runtime.js", () => ({
 const { runGatewayUpdate } = await import("../infra/update-runner.js");
 const { resolveOpenClawPackageRoot } = await import("../infra/openclaw-root.js");
 const { readConfigFileSnapshot, writeConfigFile } = await import("../config/config.js");
-const { checkUpdateStatus, fetchNpmTagVersion, resolveNpmChannelTag } =
+const { checkUpdateStatus, fetchNpmPackageTargetStatus, fetchNpmTagVersion, resolveNpmChannelTag } =
   await import("../infra/update-check.js");
 const { runCommandWithTimeout } = await import("../process/exec.js");
 const { runDaemonRestart, runDaemonInstall } = await import("./daemon-cli.js");
@@ -305,10 +308,16 @@ describe("update-cli", () => {
       tag: "latest",
       version: "9999.0.0",
     });
+    vi.mocked(fetchNpmPackageTargetStatus).mockResolvedValue({
+      target: "latest",
+      version: "9999.0.0",
+      nodeEngine: ">=22.14.0",
+    });
     vi.mocked(resolveNpmChannelTag).mockResolvedValue({
       tag: "latest",
       version: "9999.0.0",
     });
+    nodeVersionSatisfiesEngine.mockReturnValue(true);
     vi.mocked(checkUpdateStatus).mockResolvedValue({
       root: "/test/path",
       installKind: "git",
@@ -445,10 +454,11 @@ describe("update-cli", () => {
         name: "json output",
         options: { json: true },
         assert: () => {
-          const last = vi.mocked(defaultRuntime.log).mock.calls.at(-1)?.[0];
-          expect(typeof last).toBe("string");
-          const parsed = JSON.parse(String(last));
-          expect(parsed.channel.value).toBe("stable");
+          const last = vi.mocked(defaultRuntime.writeJson).mock.calls.at(-1)?.[0];
+          expect(last).toBeDefined();
+          const parsed = last as Record<string, unknown>;
+          const channel = parsed.channel as { value?: unknown };
+          expect(channel.value).toBe("stable");
         },
       },
     ] as const;
@@ -573,6 +583,30 @@ describe("update-cli", () => {
     );
   });
 
+  it("blocks package updates when the target requires a newer Node runtime", async () => {
+    mockPackageInstallStatus(createCaseDir("openclaw-update"));
+    vi.mocked(fetchNpmPackageTargetStatus).mockResolvedValue({
+      target: "latest",
+      version: "2026.3.23-2",
+      nodeEngine: ">=22.14.0",
+    });
+    nodeVersionSatisfiesEngine.mockReturnValue(false);
+
+    await updateCommand({ yes: true });
+
+    expect(runGatewayUpdate).not.toHaveBeenCalled();
+    expect(runCommandWithTimeout).not.toHaveBeenCalledWith(
+      ["npm", "i", "-g", "openclaw@latest", "--no-fund", "--no-audit", "--loglevel=error"],
+      expect.any(Object),
+    );
+    expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
+    const errors = vi.mocked(defaultRuntime.error).mock.calls.map((call) => String(call[0]));
+    expect(errors.join("\n")).toContain("Node ");
+    expect(errors.join("\n")).toContain(
+      "Bare `npm i -g openclaw` can silently install an older compatible release.",
+    );
+  });
+
   it("resolves package install specs from tags and env overrides", async () => {
     for (const scenario of [
       {
@@ -634,14 +668,14 @@ describe("update-cli", () => {
       JSON.stringify({ name: "openclaw", version: "2026.3.23" }),
       "utf-8",
     );
-    for (const relativePath of REQUIRED_BUNDLED_RUNTIME_SIDECARS) {
+    for (const relativePath of BUNDLED_RUNTIME_SIDECAR_PATHS) {
       const absolutePath = path.join(pkgRoot, relativePath);
       await fs.mkdir(path.dirname(absolutePath), { recursive: true });
       await fs.writeFile(absolutePath, "export {};\n", "utf-8");
     }
     readPackageVersion.mockResolvedValue("2026.3.23");
     pathExists.mockImplementation(async (candidate: string) =>
-      REQUIRED_BUNDLED_RUNTIME_SIDECARS.some(
+      BUNDLED_RUNTIME_SIDECAR_PATHS.some(
         (relativePath) => candidate === path.join(pkgRoot, relativePath),
       ),
     );
@@ -734,19 +768,11 @@ describe("update-cli", () => {
         name: "outputs JSON when --json is set",
         run: async () => {
           vi.mocked(runGatewayUpdate).mockResolvedValue(makeOkUpdateResult());
-          vi.mocked(defaultRuntime.log).mockClear();
+          vi.mocked(defaultRuntime.writeJson).mockClear();
           await updateCommand({ json: true });
         },
         assert: () => {
-          const logCalls = vi.mocked(defaultRuntime.log).mock.calls;
-          const jsonOutput = logCalls.find((call) => {
-            try {
-              JSON.parse(call[0] as string);
-              return true;
-            } catch {
-              return false;
-            }
-          });
+          const jsonOutput = vi.mocked(defaultRuntime.writeJson).mock.calls.at(-1)?.[0];
           expect(jsonOutput).toBeDefined();
         },
       },
