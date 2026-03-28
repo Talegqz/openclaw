@@ -45,6 +45,7 @@ export function createMSTeamsReplyDispatcher(params: {
   sharePointSiteId?: string;
 }) {
   const core = getMSTeamsRuntime();
+  const msteamsCfg = params.cfg.channels?.msteams;
   const conversationType = params.conversationRef.conversation?.conversationType?.toLowerCase();
   const isTypingSupported = conversationType === "personal" || conversationType === "groupchat";
 
@@ -239,6 +240,8 @@ export function createMSTeamsReplyDispatcher(params: {
               streamController.onPartialReply(payload),
           }
         : {}),
+      disableBlockStreaming:
+        typeof msteamsCfg?.blockStreaming === "boolean" ? !msteamsCfg.blockStreaming : undefined,
       onModelSelected,
     },
     markDispatchIdle,
